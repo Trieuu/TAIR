@@ -67,7 +67,9 @@ from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs, set_seed
 
 # TAIR repo imports
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "testr"))
 import initialize
 from adet.evaluation import text_eval_script
 from adet.evaluation.text_evaluation import TextEvaluator
