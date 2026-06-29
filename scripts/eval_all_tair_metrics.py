@@ -356,6 +356,8 @@ def _write_detection_zip_with_testr_export(
 ) -> Path:
     """Use TESTR TextEvaluator's own export/sort code to create det.zip."""
 
+    text_results_path = text_results_path.resolve()
+    eval_dir = eval_dir.resolve()
     _cleanup_official_export_dir(eval_dir)
     exporter = TextEvaluator.__new__(TextEvaluator)
     cwd = Path.cwd()
@@ -364,7 +366,7 @@ def _write_detection_zip_with_testr_export(
     try:
         os.chdir(eval_dir)
         exporter.to_eval_format(
-            str(text_results_path.resolve()),
+            str(text_results_path),
             temp_dir="temp_det_results/",
             cf_th=confidence_threshold,
         )
@@ -490,6 +492,71 @@ def evaluate_text_spotting_official(
     }
 
 
+def evaluate_existing_official_text_eval(
+    out_dir: Path,
+    *,
+    is_word_spotting: bool,
+    confidence_threshold: float,
+) -> dict:
+    """Run only the official TESTR evaluator from an existing export folder."""
+
+    eval_dir = out_dir / "official_text_eval"
+    gt_zip = eval_dir / "gt.zip"
+    text_results_path = eval_dir / "text_results.json"
+    mapping_path = eval_dir / "sample_mapping.json"
+
+    missing = [str(path) for path in [gt_zip, text_results_path] if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Cannot run --official_text_eval_only because required file(s) "
+            f"are missing: {', '.join(missing)}"
+        )
+
+    det_zip = _write_detection_zip_with_testr_export(
+        text_results_path,
+        eval_dir,
+        confidence_threshold,
+    )
+    official = text_eval_script.text_eval_main(
+        det_file=str(det_zip),
+        gt_file=str(gt_zip),
+        is_word_spotting=is_word_spotting,
+    )
+
+    mapping = []
+    if mapping_path.exists():
+        mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+    text_results = json.loads(text_results_path.read_text(encoding="utf-8"))
+
+    result = {
+        "det": _parse_official_metric_line(official["det_only_method"]),
+        "e2e": _parse_official_metric_line(official["e2e_method"]),
+        "raw": {
+            "det_only_method": official["det_only_method"],
+            "e2e_method": official["e2e_method"],
+        },
+        "files": {
+            "gt_zip": str(gt_zip),
+            "det_zip": str(det_zip),
+            "text_results_json": str(text_results_path),
+            "sample_mapping": str(mapping_path) if mapping_path.exists() else None,
+        },
+        "is_word_spotting": is_word_spotting,
+        "confidence_threshold": confidence_threshold,
+        "n_images": len(mapping) if mapping else None,
+        "n_gt_instances": (
+            sum(int(item.get("gt_instances", 0)) for item in mapping)
+            if mapping
+            else None
+        ),
+        "n_pred_instances": len(text_results),
+    }
+    metrics_path = eval_dir / "official_metrics.json"
+    result["files"]["official_metrics_json"] = str(metrics_path)
+    metrics_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Prerequisite check
 # ---------------------------------------------------------------------------
@@ -536,6 +603,18 @@ def main(args):
         if args.text_eval_confidence is not None
         else float(testr_cfg.MODEL.FCOS.INFERENCE_TH_TEST)
     )
+
+    if args.official_text_eval_only:
+        ts_metrics = evaluate_existing_official_text_eval(
+            Path(args.out_dir),
+            is_word_spotting=args.word_spotting,
+            confidence_threshold=text_eval_confidence,
+        )
+        print("Official TESTR text evaluation completed from existing files.")
+        print(f"  Det precision/recall/F1: {ts_metrics['det']}")
+        print(f"  E2E precision/recall/F1: {ts_metrics['e2e']}")
+        print(f"  Saved: {ts_metrics['files']['official_metrics_json']}")
+        return
 
     # Override config paths if provided via CLI
     if args.gt_img_path:
@@ -925,6 +1004,15 @@ if __name__ == "__main__":
         action="store_true",
         help="Also save the previous custom Det/E2E approximation under "
              "text_spotting.legacy_custom for comparison.",
+    )
+    parser.add_argument(
+        "--official_text_eval_only",
+        action="store_true",
+        help=(
+            "Skip model inference/restoration and rerun only TESTR's official "
+            "text evaluator from <out_dir>/official_text_eval/text_results.json "
+            "and gt.zip."
+        ),
     )
     args = parser.parse_args()
     main(args)
