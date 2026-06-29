@@ -726,11 +726,17 @@ def main(args):
         if isinstance(model, nn.Module):
             model.eval()
 
-    ts_model = models["testr"]
+    # Match val.py: TESTR predictions are converted into text prompts during
+    # diffusion sampling, so this threshold can change the restored image.
+    testr_sampling_threshold = (
+        float(args.testr_sampling_threshold)
+        if args.testr_sampling_threshold is not None
+        else 0.5
+    )
     print(
-        "TESTR detection threshold: "
-        f"{getattr(ts_model, 'test_score_threshold', 'unknown')} "
-        "(from TESTR config/model)"
+        "TESTR sampling threshold: "
+        f"{testr_sampling_threshold} "
+        "(matches val.py default unless overridden)"
     )
     print(f"TESTR official export confidence threshold: {text_eval_confidence}")
 
@@ -740,8 +746,8 @@ def main(args):
         lq_id = Path(lq_path).stem
         assert gt_id == lq_id, f"Stem mismatch: {gt_id} vs {lq_id}"
 
-        gt_img = Image.open(gt_path).convert("RGB")
-        lq_img = Image.open(lq_path).convert("RGB")
+        gt_img = Image.open(gt_path)
+        lq_img = Image.open(lq_path)
 
         val_gt = preprocess_gt(gt_img).unsqueeze(0).to(device)
         val_lq = preprocess_lq(lq_img).unsqueeze(0).to(device)
@@ -755,6 +761,9 @@ def main(args):
 
             pure_noise = torch.randn((1, 4, 64, 64), generator=gen, device=device, dtype=torch.float32)
 
+            models["testr"].test_score_threshold = testr_sampling_threshold
+            ts_model = models["testr"]
+
             val_z, val_ts_results = sampler.val_sample(
                 model=models["cldm"],
                 device=device,
@@ -764,7 +773,7 @@ def main(args):
                 uncond=None,
                 cfg_scale=1.0,
                 x_T=pure_noise,
-                progress=False,
+                progress=accelerator.is_main_process,
                 cfg=cfg,
                 pure_cldm=pure_cldm,
                 ts_model=ts_model,
@@ -997,6 +1006,16 @@ if __name__ == "__main__":
             "Confidence threshold passed to TESTR TextEvaluator.to_eval_format. "
             "Defaults to MODEL.FCOS.INFERENCE_TH_TEST from --config_testr, "
             "matching TESTR's bundled evaluator."
+        ),
+    )
+    parser.add_argument(
+        "--testr_sampling_threshold",
+        type=float,
+        default=None,
+        help=(
+            "TESTR score threshold used during diffusion sampling when OCR "
+            "predictions are turned into prompts. Defaults to 0.5 to match "
+            "val.py. This is separate from --text_eval_confidence."
         ),
     )
     parser.add_argument(
