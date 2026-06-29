@@ -1,0 +1,121 @@
+model:
+  cldm:
+    target: terediff.model.cldm.ControlLDM
+    params:
+      latent_scale_factor: 0.18215
+      unet_cfg:
+        use_checkpoint: True
+        image_size: 32 # unused
+        in_channels: 4
+        out_channels: 4
+        model_channels: 320
+        attention_resolutions: [ 4, 2, 1 ]
+        num_res_blocks: 2
+        channel_mult: [ 1, 2, 4, 4 ]
+        num_head_channels: 64 # need to fix for flash-attn
+        use_spatial_transformer: True
+        use_linear_in_transformer: True
+        transformer_depth: 1
+        context_dim: 1024
+        legacy: False
+      vae_cfg:
+        embed_dim: 4
+        ddconfig:
+          double_z: true
+          z_channels: 4
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult:
+          - 1
+          - 2
+          - 4
+          - 4
+          num_res_blocks: 2
+          attn_resolutions: []
+          dropout: 0.0
+      clip_cfg:
+        embed_dim: 1024
+        vision_cfg:
+          image_size: 224
+          layers: 32
+          width: 1280
+          head_width: 80
+          patch_size: 14
+        text_cfg:
+          context_length: 77
+          vocab_size: 49408
+          width: 1024
+          heads: 16
+          layers: 24
+        layer: "penultimate"
+      controlnet_cfg:
+        use_checkpoint: True
+        image_size: 32 # unused
+        in_channels: 4
+        hint_channels: 4
+        model_channels: 320
+        attention_resolutions: [ 4, 2, 1 ]
+        num_res_blocks: 2
+        channel_mult: [ 1, 2, 4, 4 ]
+        num_head_channels: 64 # need to fix for flash-attn
+        use_spatial_transformer: True
+        use_linear_in_transformer: True
+        transformer_depth: 1
+        context_dim: 1024
+        legacy: False
+
+  swinir:
+    target: terediff.model.swinir.SwinIR
+    params:
+      img_size: 64
+      patch_size: 1
+      in_chans: 3
+      embed_dim: 180
+      depths: [6, 6, 6, 6, 6, 6, 6, 6]
+      num_heads: [6, 6, 6, 6, 6, 6, 6, 6]
+      window_size: 8
+      mlp_ratio: 2
+      sf: 8
+      img_range: 1.0
+      upsampler: "nearest+conv"
+      resi_connection: "1conv"
+      unshuffle: True
+      unshuffle_scale: 8
+
+  diffusion:
+    target: terediff.model.gaussian_diffusion.Diffusion
+    params:
+      linear_start: 0.00085
+      linear_end: 0.0120
+      timesteps: 1000
+      zero_snr: True
+      parameterization: v
+
+dataset:
+  gt_img_path: ./data/Real-Text/HQ
+  lq_img_path: ./data/Real-Text/LQ
+
+train:
+  sd_path: ./weights/sd2.1-base-zsnr-laionaes5.ckpt       
+  swinir_path: ./weights/realesrgan_s4_swinir_100k.pth
+  resume: ./weights/DiffBIR_v2.1.pt
+
+log_args:
+  log_tool: 
+  wandb_key: 
+  wandb_proj_name: 
+## if you wish to use wandb for logging, uncomment the following lines and set the values
+# log_args:
+#   log_tool: wandb
+#   wandb_key: PUT_YOUR_WANDB_KEY_HERE
+#   wandb_proj_name: NAME_OF_YOUR_PROJECT
+
+exp_args:
+  mode: VAL
+  model_name: terediff_stage3
+  testr_ckpt_dir: ./weights/totaltext_testr_R_50_polygon.pth
+  resume_ckpt_dir: ./weights/terediff_stage3.pt  # to use our ckpt set it to /PATH/TO/terediff_stage3.pt
+  save_val_img_dir: ./val_demo_result
+  prompt_style: CAPTION   # choose from [CAPTION, TAG] for prompting styles
