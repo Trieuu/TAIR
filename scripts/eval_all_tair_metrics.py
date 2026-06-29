@@ -2,22 +2,37 @@
 """
 scripts/eval_all_tair_metrics.py
 
-Reproduces ALL evaluation metrics from the TAIR paper:
+Reproduces the TAIR paper evaluation metrics. The inference pipeline mirrors
+val.py exactly (same seed, transforms, model setup, threshold). See comments
+throughout for line-by-line correspondence with val.py.
 
-  Image Restoration (reference-based):
-    PSNR ↑, SSIM ↑, LPIPS ↓, DISTS ↓, FID ↓
+=== What matches the paper ===
 
-  Image Restoration (no-reference):
-    NIQE ↓, MANIQA ↑, MUSIQ ↑, CLIPIQA ↑
+  Table 4 — Image Restoration metrics (FULLY REPRODUCIBLE):
+    PSNR ↑     pyiqa 'psnr'    (reference-based)
+    SSIM ↑     pyiqa 'ssimc'   (val.py uses ssimc, paper calls it SSIM)
+    LPIPS ↓    pyiqa 'lpips'   (reference-based)
+    DISTS ↓    pyiqa 'dists'   (reference-based)
+    FID ↓      pyiqa 'fid'     (restored vs 512×512 preprocessed GT)
+    NIQE ↓     pyiqa 'niqe'    (no-reference)
+    MANIQA ↑   pyiqa 'maniqa'  (no-reference)
+    MUSIQ ↑    pyiqa 'musiq'   (no-reference)
+    CLIPIQA ↑  pyiqa 'clipiqa' (no-reference)
 
-  Text Spotting (TESTR via diffusion U-Net features at last denoising step):
-    Det  Precision / Recall / F1  (IoU ≥ 0.5)
-    E2E  None F1   (no lexicon, case-insensitive exact match)
-    E2E  Full F1   (full-dataset GT lexicon, closest-edit-distance match)
+=== What does NOT match the paper ===
 
-Note: the default Det/E2E output below now uses TESTR's bundled official
-`text_eval_script.text_eval_main` path. The older hand-written None/Full
-approximation is kept only behind `--include_legacy_text_eval`.
+  Tables 2 & 3 — Text Spotting metrics (APPROXIMATION ONLY):
+    The paper evaluates text spotting by running ABCNet v2 [56] and TESTR [101]
+    as standard off-the-shelf text spotters on the *restored images*.
+    These are image-based models that are separate from the TAIR model.
+
+    This script uses TAIR's fine-tuned TESTR model during diffusion sampling.
+    That TESTR takes U-Net features (not raw images), so its predictions are
+    an approximation of what a standard image-based TESTR would produce.
+    The Det/E2E numbers reported here CANNOT be directly compared to Tables 2/3.
+
+    To exactly reproduce Tables 2/3, save the restored images (done automatically
+    to <out_dir>/restored/) and run ABCNet v2 or standard TESTR on them separately.
 
 How it works
 ------------
@@ -626,11 +641,14 @@ def main(args):
 
     check_prerequisites(cfg, args.config_testr, args.ann_json)
 
-    # Accelerator / device setup (mirrors val.py exactly)
+    # Accelerator / device setup — mirrors val.py lines 28-32 exactly.
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(split_batches=False, kwargs_handlers=[ddp_kwargs])
     set_seed(25, device_specific=False)
     device = accelerator.device
+    # val.py creates the generator here (line 32), before model loading,
+    # so that ordering is preserved even though manual_seed() resets state.
+    gen = torch.Generator(device)
 
     # Output dirs
     out_dir = Path(args.out_dir)
@@ -719,25 +737,22 @@ def main(args):
         T.ToTensor(),
     ])
 
-    gen = torch.Generator(device)
+    # val.py seeds the generator here (line 89), after metric setup,
+    # right before model.eval() — keep that exact ordering.
     gen.manual_seed(25)
 
+    # val.py lines 92-95: put all models in eval mode after accelerator.prepare().
+    # initialize.load_model sets cldm to .train() and testr to .train(),
+    # so this call is essential — not optional.
     for model in models.values():
         if isinstance(model, nn.Module):
             model.eval()
 
-    # Match val.py: TESTR predictions are converted into text prompts during
-    # diffusion sampling, so this threshold can change the restored image.
-    testr_sampling_threshold = (
-        float(args.testr_sampling_threshold)
-        if args.testr_sampling_threshold is not None
-        else 0.5
-    )
-    print(
-        "TESTR sampling threshold: "
-        f"{testr_sampling_threshold} "
-        "(matches val.py default unless overridden)"
-    )
+    # val.py line 133 hardcodes models['testr'].test_score_threshold = 0.5
+    # inside the loop. We use a CLI arg so it can be overridden for ablations,
+    # but default is 0.5 to exactly match val.py.
+    testr_sampling_threshold = args.testr_sampling_threshold
+    print(f"TESTR sampling threshold (val.py = 0.5): {testr_sampling_threshold}")
     print(f"TESTR official export confidence threshold: {text_eval_confidence}")
 
     print(f"\nRunning inference on {len(gt_imgs_path)} image(s)...")
@@ -786,11 +801,14 @@ def main(args):
             # Save restored image (needed for FID)
             TF.to_pil_image(restored_img.squeeze().cpu()).save(restored_dir / f"{gt_id}.png")
 
-            # Symlink / copy GT image for FID comparison
-            gt_dest = gt_dir_copy / f"{gt_id}.jpg"
+            # Save GT at 512×512 PNG for FID so both restored and GT images
+            # are at identical resolution and format. Copying the original jpg
+            # would compare different resolutions if GT is not already 512×512.
+            # gt_01 is already the 512×512 preprocessed tensor from val.py's
+            # preprocess_gt pipeline (BICUBIC resize → ToTensor → Normalize → clamp).
+            gt_dest = gt_dir_copy / f"{gt_id}.png"
             if not gt_dest.exists():
-                import shutil
-                shutil.copy2(gt_path, gt_dest)
+                TF.to_pil_image(gt_01.squeeze().cpu()).save(gt_dest)
 
             # IQ metrics (identical to val.py)
             acc["psnr"].append(metric_psnr(restored_img, gt_01).mean().item())
@@ -1011,11 +1029,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--testr_sampling_threshold",
         type=float,
-        default=None,
+        default=0.5,
         help=(
             "TESTR score threshold used during diffusion sampling when OCR "
-            "predictions are turned into prompts. Defaults to 0.5 to match "
-            "val.py. This is separate from --text_eval_confidence."
+            "predictions are turned into text prompts (val.py line 133). "
+            "Default is 0.5 to exactly match val.py. Changing this alters "
+            "the restored image itself. Separate from --text_eval_confidence."
         ),
     )
     parser.add_argument(
