@@ -244,12 +244,15 @@ uv venv --python "$PYTHON_VERSION" .venv
 source .venv/bin/activate
 
 log "install Python build/runtime dependencies"
-uv pip install --upgrade pip setuptools wheel ninja
+# CLIPIQA loads OpenAI CLIP through pyiqa; that CLIP package imports
+# pkg_resources, which is no longer guaranteed in newer setuptools releases.
+uv pip install --upgrade pip wheel ninja "setuptools<70"
 uv pip install \
   "torch==${TORCH_VERSION}" \
   "torchvision==${TORCHVISION_VERSION}" \
   "torchaudio==${TORCHAUDIO_VERSION}" \
   --index-url "$CUDA_WHEEL_INDEX"
+uv pip install gdown pyarrow
 uv pip install -r requirements.txt
 # detectron2/testr setup imports torch during build. uv's default build
 # isolation hides the already-installed torch package, so editable installs
@@ -335,6 +338,15 @@ if [[ "$DOWNLOAD_SA_TEXT" == "true" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Convert HuggingFace Parquet datasets to the image-folder layout used by TAIR.
+# Real-Text becomes data/Real-Text/{HQ,LQ}; SA-Text-test becomes
+# data/SA-Text-test/{HQ,LQ_lv1,LQ_lv2,LQ_lv3}.
+# ---------------------------------------------------------------------------
+log "convert HF Parquet datasets to image folders"
+python scripts/convert_hf_parquet_to_images.py --data-root ./data \
+  || warn "Parquet conversion failed; val.py/eval scripts need extracted image folders"
+
+# ---------------------------------------------------------------------------
 # Local configs and runnable helper scripts
 # ---------------------------------------------------------------------------
 log "create local config copies"
@@ -345,7 +357,8 @@ root = Path(".")
 
 def first_existing(*paths: str) -> str | None:
     for item in paths:
-        if Path(item).exists():
+        path = Path(item)
+        if path.exists() and any(path.glob("*.jpg")):
             return item
     return None
 
@@ -354,17 +367,18 @@ val_dst = root / "configs/val/local_val_terediff.yaml"
 val_text = val_src.read_text(encoding="utf-8")
 
 lq_path = first_existing(
-    "./data/Real-Text/lq",
     "./data/Real-Text/LQ",
-    "./data/SA-Text-test/lq",
+    "./data/Real-Text/lq",
+    "./data/SA-Text-test/LQ_lv1",
     "./data/SA-Text-test/LQ",
+    "./data/SA-Text-test/lq",
     "./assets/demo_imgs/lq",
 )
 hq_path = first_existing(
-    "./data/Real-Text/hq",
     "./data/Real-Text/HQ",
-    "./data/SA-Text-test/hq",
+    "./data/Real-Text/hq",
     "./data/SA-Text-test/HQ",
+    "./data/SA-Text-test/hq",
     "./assets/demo_imgs/hq",
 )
 

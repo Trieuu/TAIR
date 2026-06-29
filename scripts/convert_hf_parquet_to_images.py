@@ -27,6 +27,7 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -43,6 +44,18 @@ def write_image(img_bytes: bytes | None, out_path: Path) -> bool:
     return True
 
 
+def count_jpgs(path: Path) -> int:
+    return len(list(path.glob("*.jpg"))) if path.exists() else 0
+
+
+def clear_extracted_outputs(paths: list[Path], ann_path: Path) -> None:
+    for path in paths:
+        if path.exists():
+            shutil.rmtree(path)
+    if ann_path.exists():
+        ann_path.unlink()
+
+
 def convert_real_text(parquet_dir: Path, out_dir: Path, overwrite: bool) -> None:
     parquets = find_parquet_files(parquet_dir)
     if not parquets:
@@ -53,9 +66,16 @@ def convert_real_text(parquet_dir: Path, out_dir: Path, overwrite: bool) -> None
     lq_dir = out_dir / "LQ"
     ann_path = out_dir / "real_benchmark_dataset.json"
 
-    if not overwrite and hq_dir.exists() and any(hq_dir.glob("*.jpg")):
+    if (
+        not overwrite
+        and ann_path.exists()
+        and count_jpgs(hq_dir) >= 50
+        and count_jpgs(lq_dir) >= 50
+    ):
         print(f"[skip] Real-Text already extracted at {out_dir}")
         return
+
+    clear_extracted_outputs([hq_dir, lq_dir], ann_path)
 
     hq_dir.mkdir(parents=True, exist_ok=True)
     lq_dir.mkdir(parents=True, exist_ok=True)
@@ -113,9 +133,16 @@ def convert_sa_text_test(parquet_dir: Path, out_dir: Path, overwrite: bool) -> N
     }
     ann_path = out_dir / "sa_text_test_dataset.json"
 
-    if not overwrite and hq_dir.exists() and any(hq_dir.glob("*.jpg")):
+    if (
+        not overwrite
+        and ann_path.exists()
+        and count_jpgs(hq_dir) >= 50
+        and all(count_jpgs(d) >= 50 for d in lv_dirs.values())
+    ):
         print(f"[skip] SA-Text-test already extracted at {out_dir}")
         return
+
+    clear_extracted_outputs([hq_dir, *lv_dirs.values()], ann_path)
 
     hq_dir.mkdir(parents=True, exist_ok=True)
     for d in lv_dirs.values():

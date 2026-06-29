@@ -299,6 +299,8 @@ class SpacedSampler(Sampler):
 
             pred_texts=[]
             pred_polys=[]
+            pred_scores=[]
+            pred_rec_scores=[]
             
             for j in range(len(results_per_img.polygons)):
                 val_ctrl_pnt= results_per_img.polygons[j].view(16,2).cpu().detach().numpy().astype(np.int32)    # 32 -> 16 2
@@ -307,6 +309,8 @@ class SpacedSampler(Sampler):
                 
                 pred_polys.append(val_ctrl_pnt)
                 pred_texts.append(val_pred_text)
+                pred_scores.append(float(results_per_img.scores[j].cpu().detach()))
+                pred_rec_scores.append(results_per_img.rec_scores[j].cpu().detach().numpy().tolist())
                 
 
             caption = [f'"{txt}"' for txt in pred_texts] 
@@ -321,7 +325,9 @@ class SpacedSampler(Sampler):
                     timestep = current_timestep,
                     pred_texts = pred_texts,
                     pred_prompt = pred_prompt,
-                    pred_polys = pred_polys
+                    pred_polys = pred_polys,
+                    pred_scores = pred_scores,
+                    pred_rec_scores = pred_rec_scores,
                 )
             )
 

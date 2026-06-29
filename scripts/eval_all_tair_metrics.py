@@ -15,6 +15,10 @@ Reproduces ALL evaluation metrics from the TAIR paper:
     E2E  None F1   (no lexicon, case-insensitive exact match)
     E2E  Full F1   (full-dataset GT lexicon, closest-edit-distance match)
 
+Note: the default Det/E2E output below now uses TESTR's bundled official
+`text_eval_script.text_eval_main` path. The older hand-written None/Full
+approximation is kept only behind `--include_legacy_text_eval`.
+
 How it works
 ------------
 TESTR in this codebase takes *diffusion U-Net features* (not raw images), so text
@@ -44,7 +48,9 @@ Usage — full Real-Text evaluation:
 import argparse
 import json
 import os
+import re
 import sys
+import zipfile
 from pathlib import Path
 
 import cv2
@@ -63,6 +69,9 @@ from accelerate.utils import DistributedDataParallelKwargs, set_seed
 # TAIR repo imports
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import initialize
+from adet.evaluation import text_eval_script
+from adet.evaluation.text_evaluation import TextEvaluator
+from adet.config import get_cfg as get_testr_cfg
 from terediff.model import ControlLDM, Diffusion
 from terediff.sampler import SpacedSampler
 from terediff.utils.common import instantiate_from_config
@@ -234,6 +243,252 @@ def evaluate_text_spotting(predictions, annotations, iou_threshold=0.5):
 
 
 # ---------------------------------------------------------------------------
+# Official TESTR text evaluation export
+# ---------------------------------------------------------------------------
+
+def _as_sequence(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
+def _looks_like_single_polygon(value) -> bool:
+    try:
+        arr = np.asarray(value, dtype=float)
+    except Exception:
+        return False
+    if arr.ndim == 1 and arr.size >= 6 and arr.size % 2 == 0:
+        return True
+    if arr.ndim == 2 and arr.shape[1] == 2 and arr.shape[0] >= 3:
+        return True
+    return False
+
+
+def _annotation_instances(ann: dict) -> list[tuple[object, str]]:
+    texts = _as_sequence(ann.get("text"))
+    polys_raw = ann.get("poly", [])
+
+    if _looks_like_single_polygon(polys_raw):
+        polys = [polys_raw]
+    else:
+        polys = _as_sequence(polys_raw)
+
+    if not texts:
+        texts = ["###"] * len(polys)
+
+    n = min(len(polys), len(texts))
+    return [(polys[i], str(texts[i])) for i in range(n)]
+
+
+def _polygon_points(poly) -> list[tuple[float, float]] | None:
+    try:
+        arr = np.asarray(poly, dtype=float).reshape(-1, 2)
+    except Exception:
+        return None
+
+    if len(arr) < 3:
+        return None
+
+    points = [(float(x), float(y)) for x, y in arr]
+    if len(points) > 1 and points[0] == points[-1]:
+        points = points[:-1]
+    if len(points) < 3:
+        return None
+
+    # Match TESTR TextEvaluator.sort_detection behavior: invalid polygons are
+    # skipped and counter-clockwise rings are reversed before official eval.
+    try:
+        from shapely.geometry import LinearRing, Polygon
+
+        polygon = Polygon(points)
+        if not polygon.is_valid or polygon.area <= 0:
+            return None
+        if LinearRing(points).is_ccw:
+            points = list(reversed(points))
+    except Exception:
+        pass
+
+    return points
+
+
+def _format_official_line(poly, text: str) -> str | None:
+    points = _polygon_points(poly)
+    if not points:
+        return None
+
+    coords = []
+    for x, y in points:
+        coords.extend([str(int(round(x))), str(int(round(y)))])
+
+    # The official parser splits transcription with ',####'.
+    clean_text = str(text).replace("\r", " ").replace("\n", " ").strip()
+    return ",".join(coords) + ",####" + clean_text
+
+
+def _write_zip_from_text_files(zip_path: Path, files: dict[str, str]) -> None:
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name, content in sorted(files.items()):
+            zf.writestr(name, content)
+
+
+def _cleanup_official_export_dir(eval_dir: Path) -> None:
+    import shutil
+
+    for name in ["temp_det_results", "final_temp_det_results"]:
+        path = eval_dir / name
+        if path.exists():
+            shutil.rmtree(path)
+    for name in ["temp_all_det_cors.txt", "det.zip"]:
+        path = eval_dir / name
+        if path.exists():
+            path.unlink()
+
+
+def _write_detection_zip_with_testr_export(
+    text_results_path: Path,
+    eval_dir: Path,
+    confidence_threshold: float,
+) -> Path:
+    """Use TESTR TextEvaluator's own export/sort code to create det.zip."""
+
+    _cleanup_official_export_dir(eval_dir)
+    exporter = TextEvaluator.__new__(TextEvaluator)
+    cwd = Path.cwd()
+    eval_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        os.chdir(eval_dir)
+        exporter.to_eval_format(
+            str(text_results_path.resolve()),
+            temp_dir="temp_det_results/",
+            cf_th=confidence_threshold,
+        )
+        det_name = exporter.sort_detection("temp_det_results/")
+    finally:
+        os.chdir(cwd)
+
+    return eval_dir / det_name
+
+
+def _parse_official_metric_line(line: str) -> dict[str, float]:
+    match = re.search(
+        r"precision:\s*([0-9.eE+-]+),\s*recall:\s*([0-9.eE+-]+),\s*hmean:\s*([0-9.eE+-]+)",
+        line,
+    )
+    if not match:
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+    precision, recall, hmean = (float(x) for x in match.groups())
+    return {
+        "precision": round(precision, 4),
+        "recall": round(recall, 4),
+        "f1": round(hmean, 4),
+    }
+
+
+def evaluate_text_spotting_official(
+    predictions: list[dict],
+    annotations: dict[str, dict],
+    out_dir: Path,
+    *,
+    is_word_spotting: bool,
+    confidence_threshold: float,
+) -> dict:
+    """Run TESTR's bundled official text evaluator on TAIR/TESTR outputs."""
+
+    eval_dir = out_dir / "official_text_eval"
+    gt_zip = eval_dir / "gt.zip"
+    text_results_path = eval_dir / "text_results.json"
+    mapping_path = eval_dir / "sample_mapping.json"
+
+    gt_files: dict[str, str] = {}
+    text_results = []
+    mapping = []
+    n_gt_instances = 0
+    n_pred_instances = 0
+
+    for sample_idx, pred in enumerate(predictions, start=1):
+        stem = pred["stem"]
+        sample_file = f"{sample_idx:07d}.txt"
+
+        ann = annotations.get(stem, {})
+        gt_lines = []
+        for poly, text in _annotation_instances(ann):
+            line = _format_official_line(poly, text)
+            if line is not None:
+                gt_lines.append(line)
+        gt_files[sample_file] = "\n".join(gt_lines)
+        n_gt_instances += len(gt_lines)
+
+        pred_polys = pred.get("pred_polys", [])
+        pred_texts = pred.get("pred_texts", [])
+        pred_scores = pred.get("pred_scores") or [1.0] * len(pred_polys)
+        n_instances = min(len(pred_polys), len(pred_texts), len(pred_scores))
+
+        for idx in range(n_instances):
+            points = _polygon_points(pred_polys[idx])
+            if points is None:
+                continue
+            text_results.append(
+                {
+                    "image_id": sample_idx,
+                    "category_id": 1,
+                    "polys": [[float(x), float(y)] for x, y in points],
+                    "rec": str(pred_texts[idx]),
+                    "score": float(pred_scores[idx]),
+                }
+            )
+        n_pred_instances += n_instances
+
+        mapping.append(
+            {
+                "official_sample": sample_file,
+                "stem": stem,
+                "gt_instances": len(gt_lines),
+                "pred_instances": n_instances,
+            }
+        )
+
+    _write_zip_from_text_files(gt_zip, gt_files)
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    text_results_path.write_text(json.dumps(text_results), encoding="utf-8")
+    det_zip = _write_detection_zip_with_testr_export(
+        text_results_path,
+        eval_dir,
+        confidence_threshold,
+    )
+    mapping_path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
+
+    official = text_eval_script.text_eval_main(
+        det_file=str(det_zip),
+        gt_file=str(gt_zip),
+        is_word_spotting=is_word_spotting,
+    )
+
+    return {
+        "det": _parse_official_metric_line(official["det_only_method"]),
+        "e2e": _parse_official_metric_line(official["e2e_method"]),
+        "raw": {
+            "det_only_method": official["det_only_method"],
+            "e2e_method": official["e2e_method"],
+        },
+        "files": {
+            "gt_zip": str(gt_zip),
+            "det_zip": str(det_zip),
+            "text_results_json": str(text_results_path),
+            "sample_mapping": str(mapping_path),
+        },
+        "is_word_spotting": is_word_spotting,
+        "confidence_threshold": confidence_threshold,
+        "n_images": len(predictions),
+        "n_gt_instances": n_gt_instances,
+        "n_pred_instances": n_pred_instances,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Prerequisite check
 # ---------------------------------------------------------------------------
 
@@ -272,6 +527,13 @@ def check_prerequisites(cfg, config_testr_path, ann_json_path):
 
 def main(args):
     cfg = OmegaConf.load(args.config)
+    testr_cfg = get_testr_cfg()
+    testr_cfg.merge_from_file(args.config_testr)
+    text_eval_confidence = (
+        float(args.text_eval_confidence)
+        if args.text_eval_confidence is not None
+        else float(testr_cfg.MODEL.FCOS.INFERENCE_TH_TEST)
+    )
 
     # Override config paths if provided via CLI
     if args.gt_img_path:
@@ -315,10 +577,28 @@ def main(args):
     assert len(gt_imgs_path) == len(lq_imgs_path), \
         f"GT/LQ count mismatch: {len(gt_imgs_path)} vs {len(lq_imgs_path)}"
 
+    print(f"GT image folder: {cfg.dataset.gt_img_path} ({len(gt_imgs_path)} .jpg)")
+    print(f"LQ image folder: {cfg.dataset.lq_img_path} ({len(lq_imgs_path)} .jpg)")
+
     if args.max_samples:
         gt_imgs_path = gt_imgs_path[: args.max_samples]
         lq_imgs_path = lq_imgs_path[: args.max_samples]
         print(f"[smoke test] limiting to {args.max_samples} sample(s)")
+    elif len(gt_imgs_path) < 50:
+        print(
+            "[warn] fewer than 50 images found. If this is not intentional, "
+            "the config may still point to demo images instead of converted "
+            "dataset folders. Use --gt_img_path and --lq_img_path to override."
+        )
+
+    matched_annotations = sum(Path(path).stem in ann_by_stem for path in gt_imgs_path)
+    print(f"Images with matching annotations: {matched_annotations}/{len(gt_imgs_path)}")
+    if matched_annotations != len(gt_imgs_path):
+        print(
+            "[warn] some evaluated image stems do not appear in the annotation JSON. "
+            "Text metrics for those images will have empty GT. Check --ann_json, "
+            "--gt_img_path, and --lq_img_path."
+        )
 
     # Load models via the repo's initialize module (mirrors val.py)
     models, _ = initialize.load_model(accelerator, device, args, cfg)
@@ -365,8 +645,13 @@ def main(args):
         if isinstance(model, nn.Module):
             model.eval()
 
-    models["testr"].test_score_threshold = 0.5
     ts_model = models["testr"]
+    print(
+        "TESTR detection threshold: "
+        f"{getattr(ts_model, 'test_score_threshold', 'unknown')} "
+        "(from TESTR config/model)"
+    )
+    print(f"TESTR official export confidence threshold: {text_eval_confidence}")
 
     print(f"\nRunning inference on {len(gt_imgs_path)} image(s)...")
     for gt_path, lq_path in tqdm(zip(gt_imgs_path, lq_imgs_path), total=len(gt_imgs_path)):
@@ -437,9 +722,17 @@ def main(args):
                         for p in last["pred_polys"]
                     ],
                     "pred_texts": last["pred_texts"],
+                    "pred_scores": last.get("pred_scores", []),
+                    "pred_rec_scores": last.get("pred_rec_scores", []),
                 })
             else:
-                ts_predictions.append({"stem": gt_id, "pred_polys": [], "pred_texts": []})
+                ts_predictions.append({
+                    "stem": gt_id,
+                    "pred_polys": [],
+                    "pred_texts": [],
+                    "pred_scores": [],
+                    "pred_rec_scores": [],
+                })
 
     # -----------------------------------------------------------------------
     # Aggregate IQ metrics
@@ -464,8 +757,18 @@ def main(args):
     # -----------------------------------------------------------------------
     # Text spotting evaluation
     # -----------------------------------------------------------------------
-    print("\nEvaluating text spotting...")
-    ts_metrics = evaluate_text_spotting(ts_predictions, ann_by_stem)
+    print("\nEvaluating text spotting with official TESTR text_eval_script...")
+    ts_metrics = evaluate_text_spotting_official(
+        ts_predictions,
+        ann_by_stem,
+        out_dir,
+        is_word_spotting=args.word_spotting,
+        confidence_threshold=text_eval_confidence,
+    )
+
+    legacy_ts_metrics = None
+    if args.include_legacy_text_eval:
+        legacy_ts_metrics = evaluate_text_spotting(ts_predictions, ann_by_stem)
 
     # -----------------------------------------------------------------------
     # Collate and save results
@@ -484,8 +787,20 @@ def main(args):
             "MUSIQ":   round(ir_metrics["musiq"],   4),
             "CLIPIQA": round(ir_metrics["clipiqa"], 4),
         },
-        "text_spotting": ts_metrics,
+        "text_spotting": {
+            "official_testr": ts_metrics,
+            "note": (
+                "Det/E2E are computed by exporting TAIR/TESTR predictions and "
+                "converted GT annotations to TESTR's official zip format, then "
+                "calling adet.evaluation.text_eval_script.text_eval_main. This "
+                "matches the bundled TESTR evaluator path. The E2E value uses "
+                "the raw decoded TAIR sampler predictions; lexicon-corrected "
+                "Full mode requires a separate TESTR lexicon-matching export."
+            ),
+        },
     }
+    if legacy_ts_metrics is not None:
+        results["text_spotting"]["legacy_custom"] = legacy_ts_metrics
 
     out_json = out_dir / "metrics.json"
     out_txt  = out_dir / "metrics.txt"
@@ -511,16 +826,20 @@ def main(args):
         f"  CLIPIQA : {results['image_restoration']['CLIPIQA']:>8}  ↑",
         "",
         "── Text Spotting ──────────────────────────────────────────",
+        f"  Backend        : official TESTR text_eval_script.text_eval_main",
+        f"  Word spotting  : {ts_metrics['is_word_spotting']}",
+        f"  Conf threshold : {ts_metrics['confidence_threshold']}",
+        f"  GT instances   : {ts_metrics['n_gt_instances']}",
+        f"  Pred instances : {ts_metrics['n_pred_instances']}",
         f"  Det  Precision : {ts_metrics['det']['precision']:>6}",
         f"  Det  Recall    : {ts_metrics['det']['recall']:>6}",
         f"  Det  F1        : {ts_metrics['det']['f1']:>6}",
-        f"  E2E-None P     : {ts_metrics['e2e_none']['precision']:>6}",
-        f"  E2E-None R     : {ts_metrics['e2e_none']['recall']:>6}",
-        f"  E2E-None F1    : {ts_metrics['e2e_none']['f1']:>6}",
-        f"  E2E-Full P     : {ts_metrics['e2e_full']['precision']:>6}",
-        f"  E2E-Full R     : {ts_metrics['e2e_full']['recall']:>6}",
-        f"  E2E-Full F1    : {ts_metrics['e2e_full']['f1']:>6}",
-        f"  (Full lexicon size: {ts_metrics['lexicon_size']} unique words)",
+        f"  E2E  Precision : {ts_metrics['e2e']['precision']:>6}",
+        f"  E2E  Recall    : {ts_metrics['e2e']['recall']:>6}",
+        f"  E2E  F1        : {ts_metrics['e2e']['f1']:>6}",
+        f"  Text results   : {ts_metrics['files']['text_results_json']}",
+        f"  Eval GT zip    : {ts_metrics['files']['gt_zip']}",
+        f"  Eval det zip   : {ts_metrics['files']['det_zip']}",
         "",
         "=" * 60,
         f"JSON saved to: {out_json}",
@@ -582,6 +901,28 @@ if __name__ == "__main__":
         default=None,
         help="Process only the first N images (smoke test). "
              "FID requires ≥50 images and is skipped otherwise.",
+    )
+    parser.add_argument(
+        "--word_spotting",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Pass is_word_spotting to TESTR text_eval_main (default: true).",
+    )
+    parser.add_argument(
+        "--text_eval_confidence",
+        type=float,
+        default=None,
+        help=(
+            "Confidence threshold passed to TESTR TextEvaluator.to_eval_format. "
+            "Defaults to MODEL.FCOS.INFERENCE_TH_TEST from --config_testr, "
+            "matching TESTR's bundled evaluator."
+        ),
+    )
+    parser.add_argument(
+        "--include_legacy_text_eval",
+        action="store_true",
+        help="Also save the previous custom Det/E2E approximation under "
+             "text_spotting.legacy_custom for comparison.",
     )
     args = parser.parse_args()
     main(args)
