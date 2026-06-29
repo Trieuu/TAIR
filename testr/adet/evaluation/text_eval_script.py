@@ -8,7 +8,13 @@ import sys
 
 import math 
 
-from rapidfuzz import string_metric
+try:
+    from rapidfuzz import string_metric
+except ImportError:
+    from rapidfuzz.distance import Levenshtein
+
+    class string_metric:
+        levenshtein = staticmethod(Levenshtein.distance)
 
 WORD_SPOTTING =True
 def evaluation_imports():
