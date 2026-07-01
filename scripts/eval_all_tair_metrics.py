@@ -851,6 +851,7 @@ def main(args):
     # FID (skip if too few images — FID is meaningless on <50 images)
     # -----------------------------------------------------------------------
     fid_score = None
+    fid_label = None
     n_images = len(gt_imgs_path)
     if n_images >= 50:
         print(f"\nComputing FID on {n_images} images...")
@@ -859,8 +860,10 @@ def main(args):
             fid_score = float(metric_fid(str(restored_dir), str(gt_dir_copy)))
         except Exception as e:
             print(f"[warn] FID computation failed: {e}")
+            fid_label = f"N/A (computation failed: {type(e).__name__})"
     else:
         print(f"\n[skip] FID requires ≥50 images; have {n_images}. Set --max_samples 0 for full eval.")
+        fid_label = f"N/A (<50 images, have {n_images})"
 
     # -----------------------------------------------------------------------
     # Text spotting evaluation
@@ -889,7 +892,7 @@ def main(args):
             "SSIM":    round(ir_metrics["ssim"],    4),
             "LPIPS":   round(ir_metrics["lpips"],   4),
             "DISTS":   round(ir_metrics["dists"],   4),
-            "FID":     round(fid_score, 4) if fid_score is not None else "N/A (<50 images)",
+            "FID":     round(fid_score, 4) if fid_score is not None else fid_label,
             "NIQE":    round(ir_metrics["niqe"],    4),
             "MANIQA":  round(ir_metrics["maniqa"],  4),
             "MUSIQ":   round(ir_metrics["musiq"],   4),
