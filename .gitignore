@@ -55,3 +55,4 @@ model_ts*.txt
 .vscode
 _darcs
 
+vast_setup_infer_fphdr.sh
