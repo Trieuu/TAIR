@@ -20,14 +20,15 @@ IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 PATCH_SIZE = 512
 
 
-def resolve_output_path(output: str, input_path: Path) -> Path:
+def resolve_output_path(output: str, input_path: Path, compare: bool = False) -> Path:
     output_path = Path(output)
     if output_path.suffix.lower() in IMAGE_SUFFIXES:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         return output_path
 
     output_path.mkdir(parents=True, exist_ok=True)
-    return output_path / f"restored_{input_path.stem}_top_left_512.png"
+    prefix = "compare" if compare else "restored"
+    return output_path / f"{prefix}_{input_path.stem}_top_left_512.png"
 
 
 def load_top_left_patch(input_path: Path) -> Image.Image:
@@ -45,7 +46,7 @@ def load_top_left_patch(input_path: Path) -> Image.Image:
 def restore_patch(args: argparse.Namespace) -> Path:
     input_path = Path(args.input)
     patch = load_top_left_patch(input_path)
-    output_path = resolve_output_path(args.output, input_path)
+    output_path = resolve_output_path(args.output, input_path, args.compare)
 
     kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(split_batches=False, kwargs_handlers=[kwargs])
@@ -108,8 +109,15 @@ def restore_patch(args: argparse.Namespace) -> Path:
 
     if accelerator.is_main_process:
         restored_img_pil = TF.to_pil_image(restored_img.squeeze().cpu())
-        restored_img_pil.save(output_path)
-        print(f"Saved restored patch to {output_path}")
+        if args.compare:
+            compare_img = Image.new("RGB", (PATCH_SIZE * 2, PATCH_SIZE))
+            compare_img.paste(patch, (0, 0))
+            compare_img.paste(restored_img_pil, (PATCH_SIZE, 0))
+            compare_img.save(output_path)
+            print(f"Saved comparison image to {output_path}")
+        else:
+            restored_img_pil.save(output_path)
+            print(f"Saved restored patch to {output_path}")
 
     accelerator.wait_for_everyone()
     return output_path
@@ -130,6 +138,11 @@ def parse_args() -> argparse.Namespace:
         default="testr/configs/TESTR/TESTR_R_50_Polygon.yaml",
     )
     parser.add_argument("--seed", type=int, default=25)
+    parser.add_argument(
+        "--compare",
+        action="store_true",
+        help="Save original and restored top-left patches side by side.",
+    )
     return parser.parse_args()
 
 
