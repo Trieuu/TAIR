@@ -35,6 +35,55 @@ def resolve_output_paths(output: str, input_path: Path) -> tuple[Path, Path]:
     return restored_path, compare_path
 
 
+def resolve_report_dir(output: str) -> Path:
+    output_path = Path(output)
+    if output_path.suffix.lower() in IMAGE_SUFFIXES:
+        return output_path.parent
+    return output_path
+
+
+def count_params(module: nn.Module) -> dict[str, int]:
+    return {
+        "parameters": sum(p.numel() for p in module.parameters()),
+        "trainable_parameters": sum(
+            p.numel() for p in module.parameters() if p.requires_grad
+        ),
+    }
+
+
+def save_param_report(models: dict[str, nn.Module], output: str) -> Path:
+    module_counts = {
+        name: count_params(module)
+        for name, module in models.items()
+        if isinstance(module, nn.Module)
+    }
+    report = {
+        "total_parameters": sum(
+            counts["parameters"] for counts in module_counts.values()
+        ),
+        "total_trainable_parameters": sum(
+            counts["trainable_parameters"] for counts in module_counts.values()
+        ),
+        "modules": module_counts,
+    }
+
+    cldm = models.get("cldm")
+    if isinstance(cldm, nn.Module):
+        cldm_submodules = {}
+        for name in ("unet", "controlnet", "vae", "clip"):
+            submodule = getattr(cldm, name, None)
+            if isinstance(submodule, nn.Module):
+                cldm_submodules[name] = count_params(submodule)
+        if cldm_submodules:
+            report["cldm_submodules"] = cldm_submodules
+
+    report_dir = resolve_report_dir(output)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / "param_report.yaml"
+    OmegaConf.save(config=OmegaConf.create(report), f=report_path)
+    return report_path
+
+
 def load_top_left_patch(input_path: Path) -> Image.Image:
     with Image.open(input_path) as image:
         image = image.convert("RGB")
@@ -62,6 +111,10 @@ def restore_patch(args: argparse.Namespace) -> Path:
     cfg = OmegaConf.load(args.config)
 
     models, _ = initialize.load_model(accelerator, device, args, cfg)
+
+    if args.param_report and accelerator.is_main_process:
+        report_path = save_param_report(models, args.output)
+        print(f"Saved parameter report to {report_path}")
 
     diffusion: Diffusion = instantiate_from_config(cfg.model.diffusion)
     diffusion.to(device)
@@ -146,6 +199,11 @@ def parse_args() -> argparse.Namespace:
         "--compare",
         action="store_true",
         help="Save original and restored top-left patches side by side.",
+    )
+    parser.add_argument(
+        "--param-report",
+        action="store_true",
+        help="Save module parameter counts to param_report.yaml in the output folder.",
     )
     return parser.parse_args()
 
