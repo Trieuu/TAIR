@@ -24,22 +24,37 @@ def resolve_output_paths(output: str, input_path: Path) -> tuple[Path, Path]:
     output_path = Path(output)
     if output_path.suffix.lower() in IMAGE_SUFFIXES:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        compare_path = output_path.with_name(
-            f"{output_path.stem}_compare{output_path.suffix}"
-        )
-        return output_path, compare_path
+        artifact_dir = output_path.parent / input_path.stem
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        return output_path, artifact_dir
 
-    output_path.mkdir(parents=True, exist_ok=True)
-    restored_path = output_path / f"restored_{input_path.stem}_top_left_512.png"
-    compare_path = output_path / f"compare_{input_path.stem}_top_left_512.png"
-    return restored_path, compare_path
+    artifact_dir = output_path / input_path.stem
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    restored_path = artifact_dir / f"restored_{input_path.stem}.png"
+    return restored_path, artifact_dir
 
 
-def resolve_report_dir(output: str) -> Path:
-    output_path = Path(output)
-    if output_path.suffix.lower() in IMAGE_SUFFIXES:
-        return output_path.parent
-    return output_path
+def validate_stride(stride: int) -> None:
+    if stride <= 0:
+        raise ValueError(f"--stride must be greater than 0; got {stride}")
+
+
+def iter_patch_coords(width: int, height: int, stride: int):
+    x_coords = list(range(0, width, stride))
+    for row_idx, y in enumerate(range(0, height, stride)):
+        row_x_coords = x_coords if row_idx % 2 == 0 else reversed(x_coords)
+        for x in row_x_coords:
+            yield x, y
+
+
+def make_padded_patch(image: Image.Image, x: int, y: int) -> tuple[Image.Image, int, int]:
+    width, height = image.size
+    valid_width = min(PATCH_SIZE, width - x)
+    valid_height = min(PATCH_SIZE, height - y)
+    patch = Image.new("RGB", (PATCH_SIZE, PATCH_SIZE))
+    valid_crop = image.crop((x, y, x + valid_width, y + valid_height))
+    patch.paste(valid_crop, (0, 0))
+    return patch, valid_width, valid_height
 
 
 def count_params(module: nn.Module) -> dict[str, int]:
@@ -51,7 +66,7 @@ def count_params(module: nn.Module) -> dict[str, int]:
     }
 
 
-def save_param_report(models: dict[str, nn.Module], output: str) -> Path:
+def save_param_report(models: dict[str, nn.Module], report_dir: Path) -> Path:
     module_counts = {
         name: count_params(module)
         for name, module in models.items()
@@ -77,58 +92,27 @@ def save_param_report(models: dict[str, nn.Module], output: str) -> Path:
         if cldm_submodules:
             report["cldm_submodules"] = cldm_submodules
 
-    report_dir = resolve_report_dir(output)
     report_dir.mkdir(parents=True, exist_ok=True)
     report_path = report_dir / "param_report.yaml"
     OmegaConf.save(config=OmegaConf.create(report), f=report_path)
     return report_path
 
 
-def load_top_left_patch(input_path: Path) -> Image.Image:
+def load_full_page(input_path: Path) -> Image.Image:
     with Image.open(input_path) as image:
-        image = image.convert("RGB")
-        width, height = image.size
-        if width < PATCH_SIZE or height < PATCH_SIZE:
-            raise ValueError(
-                f"Input image must be at least {PATCH_SIZE}x{PATCH_SIZE}; "
-                f"got {width}x{height}: {input_path}"
-            )
-        return image.crop((0, 0, PATCH_SIZE, PATCH_SIZE))
+        return image.convert("RGB")
 
 
-def restore_patch(args: argparse.Namespace) -> Path:
-    input_path = Path(args.input)
-    patch = load_top_left_patch(input_path)
-    output_path, compare_path = resolve_output_paths(args.output, input_path)
-
-    kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    accelerator = Accelerator(split_batches=False, kwargs_handlers=[kwargs])
-    set_seed(args.seed, device_specific=False)
-    device = accelerator.device
-    gen = torch.Generator(device)
-    gen.manual_seed(args.seed)
-
-    cfg = OmegaConf.load(args.config)
-
-    models, _ = initialize.load_model(accelerator, device, args, cfg)
-
-    if args.param_report and accelerator.is_main_process:
-        report_path = save_param_report(models, args.output)
-        print(f"Saved parameter report to {report_path}")
-
-    diffusion: Diffusion = instantiate_from_config(cfg.model.diffusion)
-    diffusion.to(device)
-    sampler = SpacedSampler(
-        diffusion.betas, diffusion.parameterization, rescale_cfg=False
-    )
-
-    models = {k: accelerator.prepare(v) for k, v in models.items()}
-    pure_cldm: ControlLDM = accelerator.unwrap_model(models["cldm"])
-
-    for model in models.values():
-        if isinstance(model, nn.Module):
-            model.eval()
-
+def restore_single_patch(
+    patch: Image.Image,
+    models: dict[str, nn.Module],
+    sampler: SpacedSampler,
+    pure_cldm: ControlLDM,
+    cfg,
+    device: torch.device,
+    gen: torch.Generator,
+    progress: bool,
+) -> Image.Image:
     val_lq = T.ToTensor()(patch).unsqueeze(0).to(device)
     val_bs, _, val_H, val_W = val_lq.shape
     val_prompt = [""]
@@ -153,7 +137,7 @@ def restore_patch(args: argparse.Namespace) -> Path:
             uncond=None,
             cfg_scale=1.0,
             x_T=pure_noise,
-            progress=accelerator.is_main_process,
+            progress=progress,
             cfg=cfg,
             pure_cldm=pure_cldm,
             ts_model=models["testr"],
@@ -164,17 +148,95 @@ def restore_patch(args: argparse.Namespace) -> Path:
             (pure_cldm.vae_decode(val_z) + 1) / 2, min=0, max=1
         )
 
+    return TF.to_pil_image(restored_img.squeeze().cpu())
+
+
+def restore_patch(args: argparse.Namespace) -> Path:
+    input_path = Path(args.input)
+    validate_stride(args.stride)
+    original_page = load_full_page(input_path)
+    output_path, artifact_dir = resolve_output_paths(args.output, input_path)
+
+    kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(split_batches=False, kwargs_handlers=[kwargs])
+    set_seed(args.seed, device_specific=False)
+    device = accelerator.device
+    gen = torch.Generator(device)
+    gen.manual_seed(args.seed)
+
+    cfg = OmegaConf.load(args.config)
+
+    models, _ = initialize.load_model(accelerator, device, args, cfg)
+
+    if args.param_report and accelerator.is_main_process:
+        report_path = save_param_report(models, artifact_dir)
+        print(f"Saved parameter report to {report_path}")
+
+    diffusion: Diffusion = instantiate_from_config(cfg.model.diffusion)
+    diffusion.to(device)
+    sampler = SpacedSampler(
+        diffusion.betas, diffusion.parameterization, rescale_cfg=False
+    )
+
+    models = {k: accelerator.prepare(v) for k, v in models.items()}
+    pure_cldm: ControlLDM = accelerator.unwrap_model(models["cldm"])
+
+    for model in models.values():
+        if isinstance(model, nn.Module):
+            model.eval()
+
+    current_result = original_page.copy()
+    width, height = original_page.size
+    patch_compare_dir = artifact_dir / "patch_compare"
+    if args.compare and accelerator.is_main_process:
+        patch_compare_dir.mkdir(parents=True, exist_ok=True)
+
+    for patch_idx, (x, y) in enumerate(iter_patch_coords(width, height, args.stride)):
+        origin_patch, valid_width, valid_height = make_padded_patch(original_page, x, y)
+        input_patch, _, _ = make_padded_patch(current_result, x, y)
+
+        restored_patch = restore_single_patch(
+            input_patch,
+            models,
+            sampler,
+            pure_cldm,
+            cfg,
+            device,
+            gen,
+            accelerator.is_main_process,
+        )
+
+        valid_restored = restored_patch.crop((0, 0, valid_width, valid_height))
+        current_result.paste(valid_restored, (x, y))
+
+        if accelerator.is_main_process:
+            print(
+                f"Restored patch {patch_idx}: "
+                f"x={x}, y={y}, valid={valid_width}x{valid_height}"
+            )
+
+            if args.compare:
+                compare_img = Image.new("RGB", (PATCH_SIZE * 3, PATCH_SIZE))
+                compare_img.paste(origin_patch, (0, 0))
+                compare_img.paste(input_patch, (PATCH_SIZE, 0))
+                compare_img.paste(restored_patch, (PATCH_SIZE * 2, 0))
+                patch_compare_path = (
+                    patch_compare_dir / f"patch_{patch_idx:04d}_x{x:04d}_y{y:04d}.png"
+                )
+                compare_img.save(patch_compare_path)
+
     if accelerator.is_main_process:
-        restored_img_pil = TF.to_pil_image(restored_img.squeeze().cpu())
-        restored_img_pil.save(output_path)
-        print(f"Saved restored patch to {output_path}")
+        current_result.save(output_path)
+        print(f"Saved restored full page to {output_path}")
 
         if args.compare:
-            compare_img = Image.new("RGB", (PATCH_SIZE * 2, PATCH_SIZE))
-            compare_img.paste(patch, (0, 0))
-            compare_img.paste(restored_img_pil, (PATCH_SIZE, 0))
-            compare_img.save(compare_path)
-            print(f"Saved comparison image to {compare_path}")
+            compare_path = artifact_dir / f"compare_full_{input_path.stem}.png"
+            full_compare = Image.new("RGB", (width * 2, height))
+            full_compare.paste(original_page, (0, 0))
+            full_compare.paste(current_result, (width, 0))
+            full_compare.save(compare_path)
+            print(f"Saved full-page comparison image to {compare_path}")
+            print(f"Saved patch comparison images to {patch_compare_dir}")
 
     accelerator.wait_for_everyone()
     return output_path
@@ -182,7 +244,7 @@ def restore_patch(args: argparse.Namespace) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Restore the top-left 512x512 patch of one image with TeReDiff."
+        description="Restore a full image with padded 512x512 TeReDiff patches."
     )
     parser.add_argument("--input", type=str, required=True)
     parser.add_argument("--output", type=str, default="outputs")
@@ -195,10 +257,11 @@ def parse_args() -> argparse.Namespace:
         default="testr/configs/TESTR/TESTR_R_50_Polygon.yaml",
     )
     parser.add_argument("--seed", type=int, default=25)
+    parser.add_argument("--stride", type=int, default=256)
     parser.add_argument(
         "--compare",
         action="store_true",
-        help="Save original and restored top-left patches side by side.",
+        help="Save full-page and per-patch comparison images.",
     )
     parser.add_argument(
         "--param-report",
