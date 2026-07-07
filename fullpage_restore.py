@@ -1,4 +1,5 @@
 import argparse
+from dataclasses import dataclass
 from itertools import zip_longest
 from pathlib import Path
 
@@ -25,6 +26,49 @@ VIS_FONT_PATHS = (
     "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
     "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
 )
+
+
+@dataclass
+class RestoreContext:
+    accelerator: Accelerator
+    cfg: object
+    models: dict[str, nn.Module]
+    param_report_models: dict[str, nn.Module]
+    sampler: SpacedSampler
+    pure_cldm: ControlLDM
+    device: torch.device
+    gen: torch.Generator
+
+
+def resolve_input_paths(input_value: str, output: str) -> list[Path]:
+    input_path = Path(input_value)
+    if input_path.is_dir():
+        output_path = Path(output)
+        if output_path.suffix.lower() in IMAGE_SUFFIXES:
+            raise ValueError(
+                "--output must be a directory when --input is a directory; "
+                f"got image output path {output_path}"
+            )
+
+        image_paths = sorted(
+            path
+            for path in input_path.iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+        )
+        if not image_paths:
+            raise ValueError(
+                f"No supported image files found directly inside {input_path}"
+            )
+        return image_paths
+
+    if not input_path.is_file():
+        raise ValueError(f"--input must be an image file or directory; got {input_path}")
+    if input_path.suffix.lower() not in IMAGE_SUFFIXES:
+        raise ValueError(
+            f"Unsupported input image suffix {input_path.suffix!r}; "
+            f"supported suffixes: {', '.join(sorted(IMAGE_SUFFIXES))}"
+        )
+    return [input_path]
 
 
 def resolve_output_paths(output: str, input_path: Path) -> tuple[Path, Path]:
@@ -262,11 +306,8 @@ def restore_single_patch(
     return TF.to_pil_image(restored_img.squeeze().cpu()), visualization_testr_result
 
 
-def restore_patch(args: argparse.Namespace) -> Path:
-    input_path = Path(args.input)
+def setup_restore_context(args: argparse.Namespace) -> RestoreContext:
     validate_stride(args.stride)
-    original_page = load_full_page(input_path)
-    output_path, artifact_dir = resolve_output_paths(args.output, input_path)
 
     kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(split_batches=False, kwargs_handlers=[kwargs])
@@ -278,10 +319,7 @@ def restore_patch(args: argparse.Namespace) -> Path:
     cfg = OmegaConf.load(args.config)
 
     models, _ = initialize.load_model(accelerator, device, args, cfg)
-
-    if args.param_report and accelerator.is_main_process:
-        report_path = save_param_report(models, artifact_dir)
-        print(f"Saved parameter report to {report_path}")
+    param_report_models = models
 
     diffusion: Diffusion = instantiate_from_config(cfg.model.diffusion)
     diffusion.to(device)
@@ -296,10 +334,34 @@ def restore_patch(args: argparse.Namespace) -> Path:
         if isinstance(model, nn.Module):
             model.eval()
 
+    return RestoreContext(
+        accelerator=accelerator,
+        cfg=cfg,
+        models=models,
+        param_report_models=param_report_models,
+        sampler=sampler,
+        pure_cldm=pure_cldm,
+        device=device,
+        gen=gen,
+    )
+
+
+def restore_single_page(
+    args: argparse.Namespace,
+    input_path: Path,
+    context: RestoreContext,
+) -> Path:
+    original_page = load_full_page(input_path)
+    output_path, artifact_dir = resolve_output_paths(args.output, input_path)
+
+    if args.param_report and context.accelerator.is_main_process:
+        report_path = save_param_report(context.param_report_models, artifact_dir)
+        print(f"Saved parameter report to {report_path}")
+
     current_result = original_page.copy()
     width, height = original_page.size
     patch_compare_dir = artifact_dir / "patch_compare"
-    if args.compare and accelerator.is_main_process:
+    if args.compare and context.accelerator.is_main_process:
         patch_compare_dir.mkdir(parents=True, exist_ok=True)
 
     for patch_idx, (x, y) in enumerate(iter_patch_coords(width, height, args.stride)):
@@ -308,19 +370,19 @@ def restore_patch(args: argparse.Namespace) -> Path:
 
         restored_patch, visualization_testr_result = restore_single_patch(
             input_patch,
-            models,
-            sampler,
-            pure_cldm,
-            cfg,
-            device,
-            gen,
-            accelerator.is_main_process,
+            context.models,
+            context.sampler,
+            context.pure_cldm,
+            context.cfg,
+            context.device,
+            context.gen,
+            context.accelerator.is_main_process,
         )
 
         valid_restored = restored_patch.crop((0, 0, valid_width, valid_height))
         current_result.paste(valid_restored, (x, y))
 
-        if accelerator.is_main_process:
+        if context.accelerator.is_main_process:
             print(
                 f"Restored patch {patch_idx}: "
                 f"x={x}, y={y}, valid={valid_width}x{valid_height}"
@@ -345,7 +407,7 @@ def restore_patch(args: argparse.Namespace) -> Path:
                 )
                 compare_img.save(patch_compare_path)
 
-    if accelerator.is_main_process:
+    if context.accelerator.is_main_process:
         current_result.save(output_path)
         print(f"Saved restored full page to {output_path}")
 
@@ -358,8 +420,17 @@ def restore_patch(args: argparse.Namespace) -> Path:
             print(f"Saved full-page comparison image to {compare_path}")
             print(f"Saved patch comparison images to {patch_compare_dir}")
 
-    accelerator.wait_for_everyone()
     return output_path
+
+
+def restore_patch(args: argparse.Namespace) -> list[Path]:
+    input_paths = resolve_input_paths(args.input, args.output)
+    context = setup_restore_context(args)
+    output_paths = [
+        restore_single_page(args, input_path, context) for input_path in input_paths
+    ]
+    context.accelerator.wait_for_everyone()
+    return output_paths
 
 
 def parse_args() -> argparse.Namespace:
