@@ -8,7 +8,7 @@ import torchvision.transforms.functional as TF
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs, set_seed
 from omegaconf import OmegaConf
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 import initialize
 from terediff.model import ControlLDM, Diffusion
@@ -18,6 +18,12 @@ from terediff.utils.common import instantiate_from_config
 
 IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 PATCH_SIZE = 512
+VIS_FONT_SIZE = 16
+VIS_FONT_PATHS = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+)
 
 
 def resolve_output_paths(output: str, input_path: Path) -> tuple[Path, Path]:
@@ -103,6 +109,66 @@ def load_full_page(input_path: Path) -> Image.Image:
         return image.convert("RGB")
 
 
+def load_visualization_font(size: int = VIS_FONT_SIZE) -> ImageFont.ImageFont:
+    for font_path in VIS_FONT_PATHS:
+        if Path(font_path).exists():
+            return ImageFont.truetype(font_path, size=size)
+    return ImageFont.load_default()
+
+
+def draw_testr_visualization(
+    restored_patch: Image.Image,
+    testr_result: dict | None,
+) -> Image.Image:
+    visualization = restored_patch.copy()
+    if not testr_result:
+        return visualization
+
+    draw = ImageDraw.Draw(visualization)
+    font = load_visualization_font()
+    pred_polys = testr_result.get("pred_polys", [])
+    pred_texts = testr_result.get("pred_texts", [])
+    pred_scores = testr_result.get("pred_scores", [])
+
+    for polygon, text, score in zip(pred_polys, pred_texts, pred_scores):
+        points = [(float(x), float(y)) for x, y in polygon]
+        if not points:
+            continue
+
+        xs = [x for x, _ in points]
+        ys = [y for _, y in points]
+        x0 = max(0, min(PATCH_SIZE - 1, int(min(xs))))
+        y0 = max(0, min(PATCH_SIZE - 1, int(min(ys))))
+        x1 = max(0, min(PATCH_SIZE - 1, int(max(xs))))
+        y1 = max(0, min(PATCH_SIZE - 1, int(max(ys))))
+        if x1 <= x0 or y1 <= y0:
+            continue
+
+        label = f"{score:.3f}: {text}"
+        draw.rectangle((x0, y0, x1, y1), outline=(0, 255, 0), width=2)
+
+        text_bbox = draw.textbbox((0, 0), label, font=font)
+        text_width = text_bbox[2] - text_bbox[0]
+        text_height = text_bbox[3] - text_bbox[1]
+        label_x = x0
+        label_y = max(0, y0 - text_height - 4)
+        if label_x + text_width + 4 > PATCH_SIZE:
+            label_x = max(0, PATCH_SIZE - text_width - 4)
+
+        draw.rectangle(
+            (
+                label_x,
+                label_y,
+                min(PATCH_SIZE - 1, label_x + text_width + 4),
+                min(PATCH_SIZE - 1, label_y + text_height + 4),
+            ),
+            fill=(0, 0, 0),
+        )
+        draw.text((label_x + 2, label_y + 2), label, fill=(0, 255, 0), font=font)
+
+    return visualization
+
+
 def restore_single_patch(
     patch: Image.Image,
     models: dict[str, nn.Module],
@@ -112,7 +178,7 @@ def restore_single_patch(
     device: torch.device,
     gen: torch.Generator,
     progress: bool,
-) -> Image.Image:
+) -> tuple[Image.Image, dict | None]:
     val_lq = T.ToTensor()(patch).unsqueeze(0).to(device)
     val_bs, _, val_H, val_W = val_lq.shape
     val_prompt = [""]
@@ -128,7 +194,7 @@ def restore_single_patch(
         )
 
         models["testr"].test_score_threshold = 0.5
-        val_z, _ = sampler.val_sample(
+        val_z, ts_results = sampler.val_sample(
             model=models["cldm"],
             device=device,
             steps=50,
@@ -148,7 +214,8 @@ def restore_single_patch(
             (pure_cldm.vae_decode(val_z) + 1) / 2, min=0, max=1
         )
 
-    return TF.to_pil_image(restored_img.squeeze().cpu())
+    final_testr_result = ts_results[-1] if ts_results else None
+    return TF.to_pil_image(restored_img.squeeze().cpu()), final_testr_result
 
 
 def restore_patch(args: argparse.Namespace) -> Path:
@@ -195,7 +262,7 @@ def restore_patch(args: argparse.Namespace) -> Path:
         origin_patch, valid_width, valid_height = make_padded_patch(original_page, x, y)
         input_patch, _, _ = make_padded_patch(current_result, x, y)
 
-        restored_patch = restore_single_patch(
+        restored_patch, final_testr_result = restore_single_patch(
             input_patch,
             models,
             sampler,
@@ -216,10 +283,14 @@ def restore_patch(args: argparse.Namespace) -> Path:
             )
 
             if args.compare:
-                compare_img = Image.new("RGB", (PATCH_SIZE * 3, PATCH_SIZE))
+                visualization_patch = draw_testr_visualization(
+                    restored_patch, final_testr_result
+                )
+                compare_img = Image.new("RGB", (PATCH_SIZE * 4, PATCH_SIZE))
                 compare_img.paste(origin_patch, (0, 0))
                 compare_img.paste(input_patch, (PATCH_SIZE, 0))
                 compare_img.paste(restored_patch, (PATCH_SIZE * 2, 0))
+                compare_img.paste(visualization_patch, (PATCH_SIZE * 3, 0))
                 patch_compare_path = (
                     patch_compare_dir / f"patch_{patch_idx:04d}_x{x:04d}_y{y:04d}.png"
                 )
