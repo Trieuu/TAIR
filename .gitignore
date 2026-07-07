@@ -56,3 +56,6 @@ model_ts*.txt
 _darcs
 
 vast_setup_infer_fphdr.sh
+
+
+data/
