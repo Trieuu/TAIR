@@ -1,4 +1,5 @@
 import argparse
+from itertools import zip_longest
 from pathlib import Path
 
 import torch
@@ -130,11 +131,34 @@ def draw_testr_visualization(
     pred_texts = testr_result.get("pred_texts", [])
     pred_scores = testr_result.get("pred_scores", [])
 
-    for polygon, text, score in zip(pred_polys, pred_texts, pred_scores):
-        points = [(float(x), float(y)) for x, y in polygon]
-        if not points:
+    for polygon, text, score in zip_longest(
+        pred_polys, pred_texts, pred_scores, fillvalue=None
+    ):
+        if polygon is None:
+            continue
+        if torch.is_tensor(polygon):
+            polygon = polygon.detach().cpu().tolist()
+        elif hasattr(polygon, "tolist"):
+            polygon = polygon.tolist()
+
+        coords = []
+        for point in polygon:
+            if torch.is_tensor(point):
+                point = point.detach().cpu().tolist()
+            elif hasattr(point, "tolist"):
+                point = point.tolist()
+            if isinstance(point, (list, tuple)) and len(point) >= 2:
+                coords.extend([point[0], point[1]])
+            else:
+                coords.append(point)
+        if len(coords) < 4:
             continue
 
+        coords = coords[: len(coords) - (len(coords) % 2)]
+        points = [
+            (float(coords[idx]), float(coords[idx + 1]))
+            for idx in range(0, len(coords), 2)
+        ]
         xs = [x for x, _ in points]
         ys = [y for _, y in points]
         x0 = max(0, min(PATCH_SIZE - 1, int(min(xs))))
@@ -144,8 +168,15 @@ def draw_testr_visualization(
         if x1 <= x0 or y1 <= y0:
             continue
 
-        label = f"{score:.3f}: {text}"
+        text = "" if text is None else str(text)
+        try:
+            label = f"{float(score):.3f}: {text}" if score is not None else text
+        except (TypeError, ValueError):
+            label = text
         draw.rectangle((x0, y0, x1, y1), outline=(0, 255, 0), width=2)
+
+        if not label:
+            continue
 
         text_bbox = draw.textbbox((0, 0), label, font=font)
         text_width = text_bbox[2] - text_bbox[0]
@@ -167,6 +198,19 @@ def draw_testr_visualization(
         draw.text((label_x + 2, label_y + 2), label, fill=(0, 255, 0), font=font)
 
     return visualization
+
+
+def testr_detection_count(testr_result: dict | None) -> int:
+    if not testr_result:
+        return 0
+    return len(testr_result.get("pred_polys", []))
+
+
+def select_visualization_testr_result(ts_results: list[dict]) -> dict | None:
+    for testr_result in reversed(ts_results):
+        if testr_detection_count(testr_result) > 0:
+            return testr_result
+    return ts_results[-1] if ts_results else None
 
 
 def restore_single_patch(
@@ -214,8 +258,8 @@ def restore_single_patch(
             (pure_cldm.vae_decode(val_z) + 1) / 2, min=0, max=1
         )
 
-    final_testr_result = ts_results[-1] if ts_results else None
-    return TF.to_pil_image(restored_img.squeeze().cpu()), final_testr_result
+    visualization_testr_result = select_visualization_testr_result(ts_results)
+    return TF.to_pil_image(restored_img.squeeze().cpu()), visualization_testr_result
 
 
 def restore_patch(args: argparse.Namespace) -> Path:
@@ -262,7 +306,7 @@ def restore_patch(args: argparse.Namespace) -> Path:
         origin_patch, valid_width, valid_height = make_padded_patch(original_page, x, y)
         input_patch, _, _ = make_padded_patch(current_result, x, y)
 
-        restored_patch, final_testr_result = restore_single_patch(
+        restored_patch, visualization_testr_result = restore_single_patch(
             input_patch,
             models,
             sampler,
@@ -283,8 +327,13 @@ def restore_patch(args: argparse.Namespace) -> Path:
             )
 
             if args.compare:
+                vis_detection_count = testr_detection_count(visualization_testr_result)
+                print(
+                    f"Patch {patch_idx} visualization detections: "
+                    f"{vis_detection_count}"
+                )
                 visualization_patch = draw_testr_visualization(
-                    restored_patch, final_testr_result
+                    restored_patch, visualization_testr_result
                 )
                 compare_img = Image.new("RGB", (PATCH_SIZE * 4, PATCH_SIZE))
                 compare_img.paste(origin_patch, (0, 0))
